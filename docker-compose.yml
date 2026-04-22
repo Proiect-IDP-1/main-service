@@ -1,0 +1,35 @@
+services:
+  db:
+    image: postgres:15
+    container_name: boardgame_db
+    restart: always
+    environment:
+      POSTGRES_USER: admin
+      POSTGRES_PASSWORD: boardgamepassword
+      POSTGRES_DB: tabletop_db
+    networks:
+      - data-net
+    ports:
+      - "5432:5432"
+
+  pgadmin:
+    image: dpage/pgadmin4
+    container_name: boardgame_pgadmin
+    restart: always
+    environment:
+      PGADMIN_DEFAULT_EMAIL: admin@tabletop.ro
+      PGADMIN_DEFAULT_PASSWORD: admin
+      PGADMIN_CONFIG_ENHANCED_COOKIE_PROTECTION: "False"
+      PGADMIN_CONFIG_CONSOLE_LOG_LEVEL: "10"
+    ports:
+      - "8080:80"
+    networks:
+      - data-net
+
+networks:
+  data-net:
+    driver: bridge
+  app-net:
+    driver: bridge
+  public-net:
+    driver: bridge
