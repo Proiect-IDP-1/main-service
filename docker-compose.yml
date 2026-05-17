@@ -1,151 +1,217 @@
+# Docker Compose pentru dezvoltare LOCALA
+
 version: '3.8'
 
 networks:
   public_net:
-    driver: overlay
+    driver: bridge
   data_net:
-    driver: overlay
-    internal: true
+    driver: bridge
+  monitor_net:
+    driver: bridge
+
+volumes:
+  auth_db_data:
+  tabletop_db_data:
+  portainer_data:
+  prometheus_data:
+  grafana_data:
+  pgadmin_data:
 
 services:
-  # Store database
-  store-db:
-    image: postgres:15
-    environment:
-      POSTGRES_USER: ${STORE_POSTGRES_USER}
-      POSTGRES_PASSWORD: ${STORE_POSTGRES_PASSWORD}
-      POSTGRES_DB: ${STORE_POSTGRES_DB}
-    volumes:
-      - store_db_data:/var/lib/postgresql/data
-    networks:
-      - data_net
-    deploy:
-      placement:
-        constraints: [node.role == worker]
-
-  # Store service
-  order-service:
-    image: ghcr.io/Proiect-IDP-1/order-service:latest
-    environment:
-      DB_HOST: ${ORDER_DB_HOST}
-      DB_NAME: ${ORDER_DB_NAME}
-      DB_USER: ${ORDER_DB_USER}
-      DB_PASS: ${ORDER_DB_PASS}
-    networks:
-      - public_net
-      - data_net
-    deploy:
-      replicas: 2
-      restart_policy:
-        condition: on-failure
-
-  # Auth database
+  # ============ Databases ============
   auth-db:
     image: postgres:15-alpine
+    container_name: auth_db
     environment:
-      POSTGRES_USER: ${AUTH_POSTGRES_USER}
-      POSTGRES_PASSWORD: ${AUTH_POSTGRES_PASSWORD}
-      POSTGRES_DB: ${AUTH_POSTGRES_DB}
-    configs:
-      - source: auth_init_script
-        target: /docker-entrypoint-initdb.d/init.sql
+      POSTGRES_USER: ${AUTH_POSTGRES_USER:-user}
+      POSTGRES_PASSWORD: ${AUTH_POSTGRES_PASSWORD:-password}
+      POSTGRES_DB: ${AUTH_POSTGRES_DB:-auth_db}
     volumes:
       - auth_db_data:/var/lib/postgresql/data
+      - ./db-init/auth/init.sql:/docker-entrypoint-initdb.d/init.sql:ro
     networks:
       - data_net
-    deploy:
-      placement:
-        constraints: [node.role == worker]
 
-  # Auth service
-  auth-service:
-    image: ghcr.io/Proiect-IDP-1/auth-service:latest
+  tabletop-db:
+    image: postgres:15
+    container_name: tabletop_db
     environment:
-      DATABASE_URL: ${DATABASE_URL}
-      JWT_SECRET: ${JWT_SECRET}
-    networks:
-      - public_net
-      - data_net
-    deploy:
-      replicas: 2
-      restart_policy:
-        condition: on-failure
-
-  # Kong service
-  kong:
-    image: kong:3.6-ubuntu
-    environment:
-      KONG_DATABASE: "off"
-      KONG_DECLARATIVE_CONFIG: /kong/kong.yml
-      KONG_PROXY_ACCESS_LOG: /dev/stdout
-      KONG_PROXY_ERROR_LOG: /dev/stderr
-    ports:
-      - "8000:8000"
-    configs:
-      - source: kong_config
-        target: /kong/kong.yml
-    networks:
-      - public_net
-    deploy:
-      replicas: 1
-      restart_policy:
-        condition: on-failure
-      placement:
-        constraints: [node.role == manager]
-
-  # Portainer
-  portainer:
-    image: portainer/portainer-ce:latest
-    command: -H unix:///var/run/docker.sock
-    ports:
-      - "9000:9000"
+      POSTGRES_USER: ${STORE_POSTGRES_USER:-admin}
+      POSTGRES_PASSWORD: ${STORE_POSTGRES_PASSWORD:-boardgamepassword}
+      POSTGRES_DB: ${STORE_POSTGRES_DB:-tabletop_db}
     volumes:
-      - portainer_data:/data
-      - /var/run/docker.sock:/var/run/docker.sock
+      - tabletop_db_data:/var/lib/postgresql/data
+      - ./db-init/tabletop:/docker-entrypoint-initdb.d:ro
     networks:
-      - public_net
-    deploy:
-      restart_policy:
-        condition: on-failure
-      placement:
-        constraints: [node.role == manager]
+      - data_net
 
-  # pgAdmin
   pgadmin:
-    image: dpage/pgadmin4
+    image: dpage/pgadmin4:8
+    container_name: pgadmin
     environment:
-      PGADMIN_DEFAULT_EMAIL: ${PGADMIN_EMAIL}
-      PGADMIN_DEFAULT_PASSWORD: ${PGADMIN_PASSWORD}
+      PGADMIN_DEFAULT_EMAIL: ${PGADMIN_EMAIL:-admin@tabletop.ro}
+      PGADMIN_DEFAULT_PASSWORD: ${PGADMIN_PASSWORD:-admin}
       PGADMIN_CONFIG_ENHANCED_COOKIE_PROTECTION: "False"
+    volumes:
+      - pgadmin_data:/var/lib/pgadmin
     ports:
       - "8080:80"
     networks:
       - data_net
       - public_net
-    deploy:
-      placement:
-        constraints: [node.role == manager]
+    depends_on:
+      - tabletop-db
+      - auth-db
 
-  # Adminer
   adminer:
-    image: adminer
+    image: adminer:4
+    container_name: adminer
     ports:
       - "8081:8080"
     networks:
       - data_net
-    deploy:
-      placement:
-        constraints: [node.role == manager]
+      - public_net
 
-configs:
-  auth_init_script:
-    file: ./init.sql
-  kong_config:
-    file: ./kong.yml
+  # ============ Microservicii ============
+  # Imaginile sunt build-uite de GitHub Actions in repo-urile respective
+  # si publicate la ghcr.io/proiect-idp-1/<service>:latest
+  # Foloseste: docker compose pull
+  auth-service:
+    image: ghcr.io/proiect-idp-1/auth-service:latest
+    container_name: auth_service
+    environment:
+      DATABASE_URL: ${DATABASE_URL:-postgres://user:password@auth-db:5432/auth_db}
+      JWT_SECRET: ${JWT_SECRET:-super_secret_cheie}
+      PORT: 3000
+    networks:
+      - public_net
+      - data_net
+      - monitor_net
+    depends_on:
+      - auth-db
 
-volumes:
-  auth_db_data:
-  store_db_data:
-  portainer_data:
+  catalog-service:
+    image: ghcr.io/proiect-idp-1/catalog-service:latest
+    container_name: catalog_service
+    environment:
+      DB_HOST: ${ORDER_DB_HOST:-tabletop-db}
+      DB_NAME: ${ORDER_DB_NAME:-tabletop_db}
+      DB_USER: ${ORDER_DB_USER:-admin}
+      DB_PASSWORD: ${ORDER_DB_PASS:-boardgamepassword}
+      JWT_SECRET: ${JWT_SECRET:-super_secret_cheie}
+      PORT: 5000
+    networks:
+      - public_net
+      - data_net
+      - monitor_net
+    depends_on:
+      - tabletop-db
 
+  order-service:
+    image: ghcr.io/proiect-idp-1/order-service:latest
+    container_name: order_service
+    environment:
+      DB_HOST: ${ORDER_DB_HOST:-tabletop-db}
+      DB_NAME: ${ORDER_DB_NAME:-tabletop_db}
+      DB_USER: ${ORDER_DB_USER:-admin}
+      DB_PASSWORD: ${ORDER_DB_PASS:-boardgamepassword}
+      JWT_SECRET: ${JWT_SECRET:-super_secret_cheie}
+      PORT: 5000
+    networks:
+      - public_net
+      - data_net
+      - monitor_net
+    depends_on:
+      - tabletop-db
 
+  # ============ Kong API Gateway ============
+  kong:
+    image: kong:3.7
+    container_name: kong
+    environment:
+      KONG_DATABASE: "off"
+      KONG_DECLARATIVE_CONFIG: /usr/local/kong/declarative/kong.yml
+      KONG_PROXY_ACCESS_LOG: /dev/stdout
+      KONG_ADMIN_ACCESS_LOG: /dev/stdout
+      KONG_PROXY_ERROR_LOG: /dev/stderr
+      KONG_ADMIN_ERROR_LOG: /dev/stderr
+      KONG_ADMIN_LISTEN: "0.0.0.0:8001"
+      KONG_PROXY_LISTEN: "0.0.0.0:8000"
+      KONG_PLUGINS: bundled,prometheus
+    volumes:
+      - ./kong/kong.yml:/usr/local/kong/declarative/kong.yml:ro
+    networks:
+      - public_net
+      - monitor_net
+    ports:
+      - "8000:8000"
+      - "8001:8001"
+
+  # ============ Portainer ============
+  portainer:
+    image: portainer/portainer-ce:2.21.0
+    container_name: portainer
+    command: -H unix:///var/run/docker.sock
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - portainer_data:/data
+    ports:
+      - "9000:9000"
+    networks:
+      - public_net
+
+  # ============ Monitoring ============
+  prometheus:
+    image: prom/prometheus:v2.52.0
+    container_name: prometheus
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.path=/prometheus
+    volumes:
+      - ./prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus_data:/prometheus
+    ports:
+      - "9090:9090"
+    networks:
+      - monitor_net
+      - public_net
+
+  grafana:
+    image: grafana/grafana:11.0.0
+    container_name: grafana
+    environment:
+      GF_SECURITY_ADMIN_USER: admin
+      GF_SECURITY_ADMIN_PASSWORD: ${PGADMIN_PASSWORD:-admin}
+    volumes:
+      - grafana_data:/var/lib/grafana
+      - ./grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./grafana/dashboards:/var/lib/grafana/dashboards:ro
+    ports:
+      - "3001:3000"
+    networks:
+      - monitor_net
+      - public_net
+    depends_on:
+      - prometheus
+
+  cadvisor:
+    image: gcr.io/cadvisor/cadvisor:v0.49.1
+    container_name: cadvisor
+    volumes:
+      - /:/rootfs:ro
+      - /var/run:/var/run:ro
+      - /sys:/sys:ro
+      - /var/lib/docker/:/var/lib/docker:ro
+    networks:
+      - monitor_net
+
+  node-exporter:
+    image: prom/node-exporter:v1.8.0
+    container_name: node_exporter
+    command:
+      - '--path.rootfs=/host'
+    volumes:
+      - /:/host:ro     # fara rslave pentru compatibilitate Docker Desktop Windows
+    networks:
+      - monitor_net

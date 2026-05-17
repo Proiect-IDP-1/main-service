@@ -1,51 +1,108 @@
-name: Deploy Stack
+name: Validate 
 
 on:
-  repository_dispatch:
-    types: [service-updated]  # Triggered by auth-service and order-service repos
   push:
-    branches:
-      - main  # Also runs on direct pushes to main (e.g. kong.yml changes)
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
 
 jobs:
-  deploy:
+  validate:
     runs-on: ubuntu-latest
-
     steps:
-      - name: Checkout main repo
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
+      - name: Validate docker-compose.yml
+        run: docker compose -f docker-compose.yml config > /dev/null
+        env:
+          AUTH_POSTGRES_USER: ${{ secrets.AUTH_POSTGRES_USER }}
+          AUTH_POSTGRES_PASSWORD: ${{ secrets.AUTH_POSTGRES_PASSWORD }}
+          AUTH_POSTGRES_DB: ${{ secrets.AUTH_POSTGRES_DB }}
+          STORE_POSTGRES_USER: ${{ secrets.STORE_POSTGRES_USER }}
+          STORE_POSTGRES_PASSWORD: ${{ secrets.STORE_POSTGRES_PASSWORD }}
+          STORE_POSTGRES_DB: ${{ secrets.STORE_POSTGRES_DB }}
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+          ORDER_DB_HOST: ${{ secrets.ORDER_DB_HOST }}
+          ORDER_DB_NAME: ${{ secrets.ORDER_DB_NAME }}
+          ORDER_DB_USER: ${{ secrets.ORDER_DB_USER }}
+          ORDER_DB_PASS: ${{ secrets.ORDER_DB_PASS }}
+          JWT_SECRET: ${{ secrets.JWT_SECRET }}
+          PGADMIN_EMAIL: ${{ secrets.PGADMIN_EMAIL }}
+          PGADMIN_PASSWORD: ${{ secrets.PGADMIN_PASSWORD }}
+
+      - name: Validate docker-stack.yml
+        run: docker compose -f docker-stack.yml config > /dev/null
+
+      - name: Validate Kong, Prometheus, Grafana configs
+        run: |
+          python3 -c "import yaml; yaml.safe_load(open('kong/kong.yml'))"
+          python3 -c "import yaml; yaml.safe_load(open('prometheus/prometheus.yml'))"
+          python3 -c "import json; json.load(open('grafana/dashboards/idp-overview.json'))"
+          echo "All configuration files are valid"
+
+      - name: Validate SQL init scripts exist
+        run: |
+          test -f db-init/auth/init.sql
+          test -f db-init/tabletop/01-schema.sql
+          test -f db-init/tabletop/02-data.sql
+          echo "All SQL init scripts present"
+
+  deploy:
+    needs: validate
+    runs-on: ubuntu-latest
+    if: github.ref == 'refs/heads/main' && (github.event_name == 'workflow_dispatch' || github.event_name == 'push')
+    environment:
+      name: production
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Generate .env from secrets
+        run: |
+          cat > .env <<EOF
+          AUTH_POSTGRES_USER=${{ secrets.AUTH_POSTGRES_USER }}
+          AUTH_POSTGRES_PASSWORD=${{ secrets.AUTH_POSTGRES_PASSWORD }}
+          AUTH_POSTGRES_DB=${{ secrets.AUTH_POSTGRES_DB }}
+          STORE_POSTGRES_USER=${{ secrets.STORE_POSTGRES_USER }}
+          STORE_POSTGRES_PASSWORD=${{ secrets.STORE_POSTGRES_PASSWORD }}
+          STORE_POSTGRES_DB=${{ secrets.STORE_POSTGRES_DB }}
+          DATABASE_URL=${{ secrets.DATABASE_URL }}
+          ORDER_DB_HOST=${{ secrets.ORDER_DB_HOST }}
+          ORDER_DB_NAME=${{ secrets.ORDER_DB_NAME }}
+          ORDER_DB_USER=${{ secrets.ORDER_DB_USER }}
+          ORDER_DB_PASS=${{ secrets.ORDER_DB_PASS }}
+          JWT_SECRET=${{ secrets.JWT_SECRET }}
+          PGADMIN_EMAIL=${{ secrets.PGADMIN_EMAIL }}
+          PGADMIN_PASSWORD=${{ secrets.PGADMIN_PASSWORD }}
+          EOF
+          echo ".env generated successfully"
+
+      - name: Deploy info
+        run: |
+          echo "============================================"
+          echo "Pentru deploy automat pe Swarm, decomenteaza"
+          echo "step-ul de mai jos si configureaza secrets:"
+          echo "  SWARM_MANAGER_HOST, SWARM_SSH_USER, SWARM_SSH_KEY"
+          echo "============================================"
+
+      
       - name: Copy files to Swarm manager
         uses: appleboy/scp-action@v0.1.7
         with:
-          host: ${{ secrets.SWARM_HOST }}
-          username: ${{ secrets.SWARM_USER }}
+          host: ${{ secrets.SWARM_MANAGER_HOST }}
+          username: ${{ secrets.SWARM_SSH_USER }}
           key: ${{ secrets.SWARM_SSH_KEY }}
-          source: "docker-compose.yml,kong.yml,init.sql"
-          target: "~/store_stack"
-
-      - name: Deploy stack on Swarm manager
+          source: "docker-stack.yml,.env,kong/,prometheus/,grafana/,db-init/"
+          target: /opt/idp/
+      
+      - name: Deploy stack on Swarm
         uses: appleboy/ssh-action@v1.0.3
         with:
-          host: ${{ secrets.SWARM_HOST }}
-          username: ${{ secrets.SWARM_USER }}
+          host: ${{ secrets.SWARM_MANAGER_HOST }}
+          username: ${{ secrets.SWARM_SSH_USER }}
           key: ${{ secrets.SWARM_SSH_KEY }}
           script: |
-            cd ~/store_stack
-            echo "STORE_POSTGRES_USER=${{ secrets.STORE_POSTGRES_USER }}" >> .env
-            echo "STORE_POSTGRES_PASSWORD=${{ secrets.STORE_POSTGRES_PASSWORD }}" >> .env
-            echo "STORE_POSTGRES_DB=${{ secrets.STORE_POSTGRES_DB }}" >> .env
-            echo "ORDER_DB_HOST=${{ secrets.ORDER_DB_HOST }}" >> .env
-            echo "ORDER_DB_NAME=${{ secrets.ORDER_DB_NAME }}" >> .env
-            echo "ORDER_DB_USER=${{ secrets.ORDER_DB_USER }}" >> .env
-            echo "ORDER_DB_PASS=${{ secrets.ORDER_DB_PASS }}" >> .env
-            echo "AUTH_POSTGRES_USER=${{ secrets.AUTH_POSTGRES_USER }}" >> .env
-            echo "AUTH_POSTGRES_PASSWORD=${{ secrets.AUTH_POSTGRES_PASSWORD }}" >> .env
-            echo "AUTH_POSTGRES_DB=${{ secrets.AUTH_POSTGRES_DB }}" >> .env
-            echo "DATABASE_URL=${{ secrets.DATABASE_URL }}" >> .env
-            echo "JWT_SECRET=${{ secrets.JWT_SECRET }}" >> .env
-            echo "PGADMIN_EMAIL=${{ secrets.PGADMIN_EMAIL }}" >> .env
-            echo "PGADMIN_PASSWORD=${{ secrets.PGADMIN_PASSWORD }}" >> .env
-            docker stack deploy --with-registry-auth -c docker-compose.yml store_stack
-
-
+            cd /opt/idp
+            echo "${{ secrets.GHCR_TOKEN }}" | docker login ghcr.io -u ${{ github.actor }} --password-stdin
+            docker stack deploy -c docker-stack.yml --with-registry-auth idp
+            docker stack services idp

@@ -1,0 +1,395 @@
+# =============================================================================
+# Docker Swarm Stack - Proiect IDP (Board Game Management)
+#
+# Cluster: 1 Manager + 2 Workers
+# 3 overlay networks:
+#   - public_net  : trafic public via Kong
+#   - data_net    : conexiuni DB (izolat de exterior - internal:true)
+#   - monitor_net : Prometheus/Grafana/cAdvisor
+# =============================================================================
+version: '3.8'
+
+# -----------------------------------------------------------------------------
+# Networks
+# -----------------------------------------------------------------------------
+networks:
+  public_net:
+    driver: overlay
+    attachable: true
+  data_net:
+    driver: overlay
+    attachable: true
+    internal: true
+  monitor_net:
+    driver: overlay
+    attachable: true
+
+# -----------------------------------------------------------------------------
+# Volumes (persistente pe manager pentru DBs)
+# -----------------------------------------------------------------------------
+volumes:
+  auth_db_data:
+  tabletop_db_data:
+  portainer_data:
+  prometheus_data:
+  grafana_data:
+  pgadmin_data:
+
+# -----------------------------------------------------------------------------
+# Configs (Swarm distribuie automat fisierele pe toate nodurile)
+# -----------------------------------------------------------------------------
+configs:
+  auth_init_script:
+    file: ./db-init/auth/init.sql
+  order_init_schema:
+    file: ./db-init/tabletop/01-schema.sql
+  order_init_data:
+    file: ./db-init/tabletop/02-data.sql
+  kong_config:
+    file: ./kong/kong.yml
+  prometheus_config:
+    file: ./prometheus/prometheus.yml
+  grafana_dashboards_provisioning:
+    file: ./grafana/provisioning/dashboards/dashboards.yml
+  grafana_datasources_provisioning:
+    file: ./grafana/provisioning/datasources/prometheus.yml
+  grafana_dashboard_json:
+    file: ./grafana/dashboards/idp-overview.json
+
+# -----------------------------------------------------------------------------
+# Services
+# -----------------------------------------------------------------------------
+services:
+
+  # ============= DATABASES =============
+  auth-db:
+    image: postgres:15-alpine
+    environment:
+      POSTGRES_USER: ${AUTH_POSTGRES_USER:-user}
+      POSTGRES_PASSWORD: ${AUTH_POSTGRES_PASSWORD:-password}
+      POSTGRES_DB: ${AUTH_POSTGRES_DB:-auth_db}
+    volumes:
+      - auth_db_data:/var/lib/postgresql/data
+    configs:
+      - source: auth_init_script
+        target: /docker-entrypoint-initdb.d/init.sql
+        mode: 0444
+    networks:
+      - data_net
+    deploy:
+      replicas: 1
+      placement:
+        constraints:
+          - node.role == manager
+      restart_policy:
+        condition: on-failure
+        max_attempts: 5
+      labels:
+        - "tier=database"
+        - "service=auth-db"
+
+  tabletop-db:
+    image: postgres:15
+    environment:
+      POSTGRES_USER: ${STORE_POSTGRES_USER:-admin}
+      POSTGRES_PASSWORD: ${STORE_POSTGRES_PASSWORD:-boardgamepassword}
+      POSTGRES_DB: ${STORE_POSTGRES_DB:-tabletop_db}
+    volumes:
+      - tabletop_db_data:/var/lib/postgresql/data
+    configs:
+      - source: order_init_schema
+        target: /docker-entrypoint-initdb.d/01-schema.sql
+        mode: 0444
+      - source: order_init_data
+        target: /docker-entrypoint-initdb.d/02-data.sql
+        mode: 0444
+    networks:
+      - data_net
+    deploy:
+      replicas: 1
+      placement:
+        constraints:
+          - node.role == manager
+      restart_policy:
+        condition: on-failure
+        max_attempts: 5
+      labels:
+        - "tier=database"
+        - "service=tabletop-db"
+
+  # ============= DB MANAGEMENT UTILITIES =============
+  pgadmin:
+    image: dpage/pgadmin4:8
+    environment:
+      PGADMIN_DEFAULT_EMAIL: ${PGADMIN_EMAIL:-admin@tabletop.ro}
+      PGADMIN_DEFAULT_PASSWORD: ${PGADMIN_PASSWORD:-admin}
+      PGADMIN_CONFIG_ENHANCED_COOKIE_PROTECTION: "False"
+    volumes:
+      - pgadmin_data:/var/lib/pgadmin
+    networks:
+      - data_net
+      - public_net
+    ports:
+      - "8080:80"
+    deploy:
+      replicas: 1
+      placement:
+        constraints:
+          - node.role == manager
+      restart_policy:
+        condition: on-failure
+      labels:
+        - "tier=utility"
+
+  adminer:
+    image: adminer:4
+    networks:
+      - data_net
+      - public_net
+    ports:
+      - "8081:8080"
+    deploy:
+      replicas: 1
+      placement:
+        constraints:
+          - node.role == worker
+      restart_policy:
+        condition: on-failure
+
+  # ============= MICROSERVICES =============
+  auth-service:
+    image: ghcr.io/proiect-idp-1/auth-service:latest
+    environment:
+      DATABASE_URL: ${DATABASE_URL:-postgres://user:password@auth-db:5432/auth_db}
+      JWT_SECRET: ${JWT_SECRET:-super_secret_cheie}
+      PORT: 3000
+    networks:
+      - public_net
+      - data_net
+      - monitor_net
+    deploy:
+      replicas: 2
+      placement:
+        constraints:
+          - node.role == worker
+      update_config:
+        parallelism: 1
+        delay: 10s
+        order: start-first
+        failure_action: rollback
+      restart_policy:
+        condition: on-failure
+        max_attempts: 5
+      labels:
+        - "tier=microservice"
+        - "service=auth"
+
+  catalog-service:
+    image: ghcr.io/proiect-idp-1/catalog-service:latest
+    environment:
+      DB_HOST: ${ORDER_DB_HOST:-tabletop-db}
+      DB_NAME: ${ORDER_DB_NAME:-tabletop_db}
+      DB_USER: ${ORDER_DB_USER:-admin}
+      DB_PASSWORD: ${ORDER_DB_PASS:-boardgamepassword}
+      JWT_SECRET: ${JWT_SECRET:-super_secret_cheie}
+      PORT: 5000
+    networks:
+      - public_net
+      - data_net
+      - monitor_net
+    deploy:
+      replicas: 2
+      placement:
+        constraints:
+          - node.role == worker
+      update_config:
+        parallelism: 1
+        delay: 10s
+        order: start-first
+        failure_action: rollback
+      restart_policy:
+        condition: on-failure
+        max_attempts: 5
+      labels:
+        - "tier=microservice"
+        - "service=catalog"
+
+  order-service:
+    image: ghcr.io/proiect-idp-1/order-service:latest
+    environment:
+      DB_HOST: ${ORDER_DB_HOST:-tabletop-db}
+      DB_NAME: ${ORDER_DB_NAME:-tabletop_db}
+      DB_USER: ${ORDER_DB_USER:-admin}
+      DB_PASSWORD: ${ORDER_DB_PASS:-boardgamepassword}
+      JWT_SECRET: ${JWT_SECRET:-super_secret_cheie}
+      PORT: 5000
+    networks:
+      - public_net
+      - data_net
+      - monitor_net
+    deploy:
+      replicas: 2
+      placement:
+        constraints:
+          - node.role == worker
+      update_config:
+        parallelism: 1
+        delay: 10s
+        order: start-first
+        failure_action: rollback
+      restart_policy:
+        condition: on-failure
+        max_attempts: 5
+      labels:
+        - "tier=microservice"
+        - "service=order"
+
+  # ============= API GATEWAY =============
+  kong:
+    image: kong:3.7
+    environment:
+      KONG_DATABASE: "off"
+      KONG_DECLARATIVE_CONFIG: /usr/local/kong/declarative/kong.yml
+      KONG_PROXY_ACCESS_LOG: /dev/stdout
+      KONG_ADMIN_ACCESS_LOG: /dev/stdout
+      KONG_PROXY_ERROR_LOG: /dev/stderr
+      KONG_ADMIN_ERROR_LOG: /dev/stderr
+      KONG_ADMIN_LISTEN: "0.0.0.0:8001"
+      KONG_PROXY_LISTEN: "0.0.0.0:8000"
+      KONG_PLUGINS: bundled,prometheus
+      KONG_LOG_LEVEL: info
+    configs:
+      - source: kong_config
+        target: /usr/local/kong/declarative/kong.yml
+        mode: 0444
+    networks:
+      - public_net
+      - monitor_net
+    ports:
+      - "8000:8000"   # Proxy public
+      - "8001:8001"   # Admin API (Prometheus scrape)
+    deploy:
+      replicas: 1
+      placement:
+        constraints:
+          - node.role == manager
+      restart_policy:
+        condition: on-failure
+      labels:
+        - "tier=gateway"
+
+  # ============= CLUSTER MANAGEMENT UI =============
+  portainer:
+    image: portainer/portainer-ce:2.21.0
+    command: -H unix:///var/run/docker.sock
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - portainer_data:/data
+    networks:
+      - public_net
+    ports:
+      - "9000:9000"
+      - "9443:9443"
+    deploy:
+      replicas: 1
+      placement:
+        constraints:
+          - node.role == manager
+      restart_policy:
+        condition: on-failure
+      labels:
+        - "tier=management"
+
+  # ============= MONITORING =============
+  prometheus:
+    image: prom/prometheus:v2.52.0
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.path=/prometheus
+      - --web.console.libraries=/usr/share/prometheus/console_libraries
+      - --web.console.templates=/usr/share/prometheus/consoles
+    configs:
+      - source: prometheus_config
+        target: /etc/prometheus/prometheus.yml
+        mode: 0444
+    volumes:
+      - prometheus_data:/prometheus
+    networks:
+      - monitor_net
+      - public_net
+    ports:
+      - "9090:9090"
+    deploy:
+      replicas: 1
+      placement:
+        constraints:
+          - node.role == manager
+      restart_policy:
+        condition: on-failure
+      labels:
+        - "tier=monitoring"
+
+  grafana:
+    image: grafana/grafana:11.0.0
+    environment:
+      GF_SECURITY_ADMIN_USER: admin
+      GF_SECURITY_ADMIN_PASSWORD: ${PGADMIN_PASSWORD:-admin}
+      GF_USERS_ALLOW_SIGN_UP: "false"
+    configs:
+      - source: grafana_dashboards_provisioning
+        target: /etc/grafana/provisioning/dashboards/dashboards.yml
+        mode: 0444
+      - source: grafana_datasources_provisioning
+        target: /etc/grafana/provisioning/datasources/prometheus.yml
+        mode: 0444
+      - source: grafana_dashboard_json
+        target: /var/lib/grafana/dashboards/idp-overview.json
+        mode: 0444
+    volumes:
+      - grafana_data:/var/lib/grafana
+    networks:
+      - monitor_net
+      - public_net
+    ports:
+      - "3001:3000"
+    deploy:
+      replicas: 1
+      placement:
+        constraints:
+          - node.role == manager
+      restart_policy:
+        condition: on-failure
+      labels:
+        - "tier=monitoring"
+
+  cadvisor:
+    image: gcr.io/cadvisor/cadvisor:v0.49.1
+    volumes:
+      - /:/rootfs:ro
+      - /var/run:/var/run:ro
+      - /sys:/sys:ro
+      - /var/lib/docker/:/var/lib/docker:ro
+      - /dev/disk/:/dev/disk:ro
+    networks:
+      - monitor_net
+    deploy:
+      mode: global
+      restart_policy:
+        condition: on-failure
+      labels:
+        - "tier=monitoring"
+
+  node-exporter:
+    image: prom/node-exporter:v1.8.0
+    command:
+      - '--path.rootfs=/host'
+    volumes:
+      - /:/host:ro,rslave
+    networks:
+      - monitor_net
+    deploy:
+      mode: global
+      restart_policy:
+        condition: on-failure
+      labels:
+        - "tier=monitoring"
