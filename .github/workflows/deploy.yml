@@ -1,0 +1,51 @@
+name: Deploy Stack
+
+on:
+  repository_dispatch:
+    types: [service-updated]  # Triggered by auth-service and order-service repos
+  push:
+    branches:
+      - main  # Also runs on direct pushes to main (e.g. kong.yml changes)
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout main repo
+        uses: actions/checkout@v4
+
+      - name: Copy files to Swarm manager
+        uses: appleboy/scp-action@v0.1.7
+        with:
+          host: ${{ secrets.SWARM_HOST }}
+          username: ${{ secrets.SWARM_USER }}
+          key: ${{ secrets.SWARM_SSH_KEY }}
+          source: "docker-compose.yml,kong.yml,init.sql"
+          target: "~/store_stack"
+
+      - name: Deploy stack on Swarm manager
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ secrets.SWARM_HOST }}
+          username: ${{ secrets.SWARM_USER }}
+          key: ${{ secrets.SWARM_SSH_KEY }}
+          script: |
+            cd ~/store_stack
+            echo "STORE_POSTGRES_USER=${{ secrets.STORE_POSTGRES_USER }}" >> .env
+            echo "STORE_POSTGRES_PASSWORD=${{ secrets.STORE_POSTGRES_PASSWORD }}" >> .env
+            echo "STORE_POSTGRES_DB=${{ secrets.STORE_POSTGRES_DB }}" >> .env
+            echo "ORDER_DB_HOST=${{ secrets.ORDER_DB_HOST }}" >> .env
+            echo "ORDER_DB_NAME=${{ secrets.ORDER_DB_NAME }}" >> .env
+            echo "ORDER_DB_USER=${{ secrets.ORDER_DB_USER }}" >> .env
+            echo "ORDER_DB_PASS=${{ secrets.ORDER_DB_PASS }}" >> .env
+            echo "AUTH_POSTGRES_USER=${{ secrets.AUTH_POSTGRES_USER }}" >> .env
+            echo "AUTH_POSTGRES_PASSWORD=${{ secrets.AUTH_POSTGRES_PASSWORD }}" >> .env
+            echo "AUTH_POSTGRES_DB=${{ secrets.AUTH_POSTGRES_DB }}" >> .env
+            echo "DATABASE_URL=${{ secrets.DATABASE_URL }}" >> .env
+            echo "JWT_SECRET=${{ secrets.JWT_SECRET }}" >> .env
+            echo "PGADMIN_EMAIL=${{ secrets.PGADMIN_EMAIL }}" >> .env
+            echo "PGADMIN_PASSWORD=${{ secrets.PGADMIN_PASSWORD }}" >> .env
+            docker stack deploy --with-registry-auth -c docker-compose.yml store_stack
+
+

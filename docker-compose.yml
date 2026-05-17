@@ -2,89 +2,150 @@ version: '3.8'
 
 networks:
   public_net:
-    driver: bridge
+    driver: overlay
   data_net:
-    driver: bridge
+    driver: overlay
+    internal: true
 
 services:
-  db:
+  # Store database
+  store-db:
     image: postgres:15
-    container_name: boardgame_db
-    restart: always
     environment:
-      POSTGRES_USER: admin
-      POSTGRES_PASSWORD: boardgamepassword
-      POSTGRES_DB: tabletop_db
+      POSTGRES_USER: ${STORE_POSTGRES_USER}
+      POSTGRES_PASSWORD: ${STORE_POSTGRES_PASSWORD}
+      POSTGRES_DB: ${STORE_POSTGRES_DB}
     volumes:
-      - db_data:/var/lib/postgresql/data
+      - store_db_data:/var/lib/postgresql/data
     networks:
       - data_net
-    ports:
-      - "5432:5432"
+    deploy:
+      placement:
+        constraints: [node.role == worker]
 
+  # Store service
+  order-service:
+    image: ghcr.io/Proiect-IDP-1/order-service:latest
+    environment:
+      DB_HOST: ${ORDER_DB_HOST}
+      DB_NAME: ${ORDER_DB_NAME}
+      DB_USER: ${ORDER_DB_USER}
+      DB_PASS: ${ORDER_DB_PASS}
+    networks:
+      - public_net
+      - data_net
+    deploy:
+      replicas: 2
+      restart_policy:
+        condition: on-failure
+
+  # Auth database
+  auth-db:
+    image: postgres:15-alpine
+    environment:
+      POSTGRES_USER: ${AUTH_POSTGRES_USER}
+      POSTGRES_PASSWORD: ${AUTH_POSTGRES_PASSWORD}
+      POSTGRES_DB: ${AUTH_POSTGRES_DB}
+    configs:
+      - source: auth_init_script
+        target: /docker-entrypoint-initdb.d/init.sql
+    volumes:
+      - auth_db_data:/var/lib/postgresql/data
+    networks:
+      - data_net
+    deploy:
+      placement:
+        constraints: [node.role == worker]
+
+  # Auth service
+  auth-service:
+    image: ghcr.io/Proiect-IDP-1/auth-service:latest
+    environment:
+      DATABASE_URL: ${DATABASE_URL}
+      JWT_SECRET: ${JWT_SECRET}
+    networks:
+      - public_net
+      - data_net
+    deploy:
+      replicas: 2
+      restart_policy:
+        condition: on-failure
+
+  # Kong service
+  kong:
+    image: kong:3.6-ubuntu
+    environment:
+      KONG_DATABASE: "off"
+      KONG_DECLARATIVE_CONFIG: /kong/kong.yml
+      KONG_PROXY_ACCESS_LOG: /dev/stdout
+      KONG_PROXY_ERROR_LOG: /dev/stderr
+    ports:
+      - "8000:8000"
+    configs:
+      - source: kong_config
+        target: /kong/kong.yml
+    networks:
+      - public_net
+    deploy:
+      replicas: 1
+      restart_policy:
+        condition: on-failure
+      placement:
+        constraints: [node.role == manager]
+
+  # Portainer
+  portainer:
+    image: portainer/portainer-ce:latest
+    command: -H unix:///var/run/docker.sock
+    ports:
+      - "9000:9000"
+    volumes:
+      - portainer_data:/data
+      - /var/run/docker.sock:/var/run/docker.sock
+    networks:
+      - public_net
+    deploy:
+      restart_policy:
+        condition: on-failure
+      placement:
+        constraints: [node.role == manager]
+
+  # pgAdmin
   pgadmin:
     image: dpage/pgadmin4
-    container_name: boardgame_pgadmin
-    restart: always
     environment:
-      PGADMIN_DEFAULT_EMAIL: admin@tabletop.ro
-      PGADMIN_DEFAULT_PASSWORD: admin
+      PGADMIN_DEFAULT_EMAIL: ${PGADMIN_EMAIL}
+      PGADMIN_DEFAULT_PASSWORD: ${PGADMIN_PASSWORD}
       PGADMIN_CONFIG_ENHANCED_COOKIE_PROTECTION: "False"
     ports:
       - "8080:80"
     networks:
       - data_net
       - public_net
+    deploy:
+      placement:
+        constraints: [node.role == manager]
 
-  auth-db:
-    image: postgres:15-alpine
-    container_name: auth_db
-    environment:
-      POSTGRES_USER: ${POSTGRES_USER}
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
-      POSTGRES_DB: ${POSTGRES_DB}
-    volumes:
-      - ./auth-service/init.sql:/docker-entrypoint-initdb.d/init.sql
-    networks:
-      - data_net
-
-  auth-service:
-    build: ./auth-service
-    container_name: auth_service
-    environment:
-      DATABASE_URL: ${DATABASE_URL}
-      JWT_SECRET: ${JWT_SECRET}
-    ports:
-      - "3000:3000"
-    depends_on:
-      - auth-db
-    networks:
-      - public_net
-      - data_net
-
+  # Adminer
   adminer:
     image: adminer
-    container_name: auth_adminer
     ports:
       - "8081:8080"
     networks:
       - data_net
+    deploy:
+      placement:
+        constraints: [node.role == manager]
 
-  order-service:
-    build: ./order-service
-    container_name: order_service
-    environment:
-      - DB_HOST=db
-      - DB_NAME=tabletop_db
-      - DB_USER=admin
-      - DB_PASS=boardgamepassword
-    ports:
-      - "5001:5000"
-    depends_on:
-      - db
-    networks:
-      - public_net
-      - data_net
+configs:
+  auth_init_script:
+    file: ./init.sql
+  kong_config:
+    file: ./kong.yml
 
 volumes:
-  db_data:
+  auth_db_data:
+  store_db_data:
+  portainer_data:
+
+
